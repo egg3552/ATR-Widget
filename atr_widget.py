@@ -1,16 +1,20 @@
 """
 ATR Widget — Cross-platform desktop widget (macOS & Windows)
 Displays the Average True Range (ATR) in pips for any market symbol.
+Aesthetic: Apple Liquid Glass — frosted blur, gradient depth, specular rim.
 
 Run: python atr_widget.py
 """
 
 import customtkinter as ctk
+import tkinter as tk
 import threading
 import time
+import math
 import yfinance as yf
 import pandas as pd
 from ta.volatility import AverageTrueRange
+from PIL import Image, ImageDraw, ImageFilter, ImageChops, ImageTk
 
 # ──────────────────────────────────────────────
 # CONFIGURATION
@@ -144,142 +148,363 @@ def fetch_atr(ticker_symbol: str, timeframe_key: str) -> dict:
 
 
 # ──────────────────────────────────────────────
-# GUI — MAIN WIDGET (customtkinter)
+# LIQUID GLASS GUI
 # ──────────────────────────────────────────────
 
-ctk.set_appearance_mode("dark")
-ctk.set_default_color_theme("dark-blue")
+# Window dimensions
+W, H = 340, 260
+CORNER = 22
 
-ACCENT  = "#00d4aa"
-ACCENT2 = "#ff6b6b"
-AMBER   = "#f5a623"
-CARD    = "#0f3460"
-DARK    = "#16213e"
-BASE    = "#1a1a2e"
-FG      = "#e0e0e0"
-FONT    = "Helvetica"
+# Colour tokens — Apple liquid glass palette
+GLASS_TOP    = (255, 255, 255, 38)   # white frost at top (RGBA)
+GLASS_BOT    = (120, 140, 180, 18)   # cool blue tint at bottom
+GRAD_A       = (15,  20,  45)        # deep navy (base gradient start)
+GRAD_B       = (30,  55,  100)       # royal blue
+SPEC_COL     = (255, 255, 255, 70)   # specular highlight rim
+ACCENT_RGB   = (80,  220, 180)       # mint-green accent
+ACCENT_HEX   = "#50dcb4"
+ACCENT2_HEX  = "#ff6b8a"
+AMBER_HEX    = "#ffb340"
+TEXT_HI      = "#ffffff"
+TEXT_MID     = "rgba(255,255,255,0.72)"
+TEXT_DIM     = "#8a9bb5"
+import sys
+FONT_SAN = "Helvetica Neue"   # will use SF Pro if available on macOS at runtime
+
+
+def _lerp_color(a, b, t):
+    return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+
+def make_glass_background(w: int, h: int, radius: int) -> Image.Image:
+    """
+    Build a liquid-glass RGBA image:
+      1. Deep gradient base (navy → royal blue, top-left lit)
+      2. Frosted white veil
+      3. Rounded-rect mask
+      4. Subtle Gaussian blur for the frosted feel
+      5. Specular rim on top edge
+    """
+    # --- base gradient (diagonal) ---
+    base = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    for y in range(h):
+        t = y / (h - 1)
+        # diagonal tint: add horizontal variation
+        row = Image.new("RGBA", (w, 1))
+        for x in range(w):
+            tx = x / (w - 1)
+            blend = (t + tx) / 2
+            rgb = _lerp_color(GRAD_A, GRAD_B, blend)
+            row.putpixel((x, 0), (*rgb, 255))
+        base.paste(row, (0, y))
+
+    # --- frosted glass veil (top half brighter) ---
+    veil = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    vd = ImageDraw.Draw(veil)
+    for y in range(h):
+        t = 1 - (y / h)   # strong at top, fades down
+        alpha = int(GLASS_TOP[3] * t + GLASS_BOT[3] * (1 - t))
+        r = int(GLASS_TOP[0] * t + GLASS_BOT[0] * (1 - t))
+        g = int(GLASS_TOP[1] * t + GLASS_BOT[1] * (1 - t))
+        b = int(GLASS_TOP[2] * t + GLASS_BOT[2] * (1 - t))
+        vd.line([(0, y), (w, y)], fill=(r, g, b, alpha))
+    base = Image.alpha_composite(base, veil)
+
+    # --- rounded rect mask ---
+    mask = Image.new("L", (w, h), 0)
+    md = ImageDraw.Draw(mask)
+    md.rounded_rectangle([0, 0, w - 1, h - 1], radius=radius, fill=255)
+    base.putalpha(mask)
+
+    # --- soft bloom / blur pass (applied only to veil layer for glass depth)
+    bloom = base.filter(ImageFilter.GaussianBlur(radius=2))
+    base = Image.blend(base.convert("RGBA"), bloom.convert("RGBA"), alpha=0.25)
+    base.putalpha(mask)  # reapply after blend
+
+    # --- specular highlight — thin bright strip at top ---
+    spec = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    sd = ImageDraw.Draw(spec)
+    highlight_h = max(4, h // 14)
+    for y in range(highlight_h):
+        t = 1 - (y / highlight_h)
+        a = int(SPEC_COL[3] * t * t)   # quadratic fade
+        sd.line([(radius, y), (w - radius, y)], fill=(*SPEC_COL[:3], a))
+    # round the spec ends with a simple mask intersection
+    spec_mask = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(spec_mask).rounded_rectangle(
+        [0, 0, w - 1, highlight_h * 2], radius=radius, fill=255
+    )
+    spec_alpha = spec.split()[3]
+    spec.putalpha(ImageChops.darker(spec_alpha, spec_mask))
+    base = Image.alpha_composite(base, spec)
+
+    # --- inner border glow ---
+    border = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    bd = ImageDraw.Draw(border)
+    bd.rounded_rectangle([0, 0, w - 1, h - 1], radius=radius,
+                         outline=(255, 255, 255, 45), width=1)
+    base = Image.alpha_composite(base, border)
+
+    return base
+
+
+def make_card_bg(w: int, h: int, radius: int = 14) -> Image.Image:
+    """Smaller inner glass card — lighter frost."""
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([0, 0, w - 1, h - 1], radius=radius,
+                        fill=(255, 255, 255, 22))
+    d.rounded_rectangle([0, 0, w - 1, h - 1], radius=radius,
+                        outline=(255, 255, 255, 55), width=1)
+    # top highlight strip
+    for y in range(3):
+        a = int(80 * (1 - y / 3))
+        d.line([(radius, y), (w - radius, y)], fill=(255, 255, 255, a))
+    return img
+
+
+ctk.set_appearance_mode("dark")
 
 
 class ATRWidget(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("ATR Widget")
+        self.title("")
         self.resizable(False, False)
         self.attributes("-topmost", True)
-        self.configure(fg_color=BASE)
+        self.overrideredirect(True)          # frameless
 
-        # Place top-right of screen
+        # Transparent window background so rounded corners show through
+        import platform
+        if platform.system() == "Darwin":
+            self.attributes("-transparent", True)
+            self.configure(fg_color="systemTransparent")
+        elif platform.system() == "Windows":
+            self.attributes("-transparentcolor", "#010203")
+            self.configure(fg_color="#010203")
+        else:
+            self.configure(fg_color="#010203")
+
         self.update_idletasks()
         sw = self.winfo_screenwidth()
-        self.geometry(f"320x240+{sw - 340}+40")
+        sh = self.winfo_screenheight()
+        self.geometry(f"{W}x{H}+{sw - W - 30}+{sh // 2 - H // 2}")
 
         self._drag_x   = 0
         self._drag_y   = 0
         self._job      = None
         self._fetching = False
+        self._pulse    = 0.0
+        self._pulse_dir = 1
 
-        # Flat symbol map
         self._sym_map = {}
         for items in SYMBOLS.values():
             self._sym_map.update(items)
 
         self._build_ui()
-        self._schedule(delay_ms=200)
+        self._animate()
+        self._schedule(delay_ms=300)
 
-    # ── Build UI ────────────────────────────────────
+    # ── Render glass background ──────────────────────
+
+    def _render_background(self):
+        img = make_glass_background(W, H, CORNER)
+        self._bg_photo = ImageTk.PhotoImage(img)
+        self._canvas.itemconfig(self._bg_item, image=self._bg_photo)
+
+        card_w, card_h = W - 32, 90
+        card_img = make_card_bg(card_w, card_h)
+        self._card_photo = ImageTk.PhotoImage(card_img)
+        self._canvas.itemconfig(self._card_item, image=self._card_photo)
+
+    # ── Build UI ─────────────────────────────────────
 
     def _build_ui(self):
-
-        # Title bar
-        title_bar = ctk.CTkFrame(self, fg_color=DARK, height=36, corner_radius=0)
-        title_bar.pack(fill="x")
-        title_bar.pack_propagate(False)
-
-        ctk.CTkLabel(
-            title_bar, text="📈  ATR Widget",
-            font=(FONT, 13, "bold"), text_color=FG,
-        ).pack(side="left", padx=12, pady=6)
-
-        self.dot = ctk.CTkLabel(
-            title_bar, text="●", font=(FONT, 11), text_color="#444444",
+        # Canvas is the entire window — glass drawn here
+        canvas_bg = "systemTransparent" if __import__("platform").system() == "Darwin" else "#010203"
+        self._canvas = tk.Canvas(
+            self, width=W, height=H,
+            bg=canvas_bg, highlightthickness=0, bd=0,
         )
-        self.dot.pack(side="right", padx=12)
+        self._canvas.place(x=0, y=0)
 
-        # Make title bar draggable
-        for w in [title_bar] + title_bar.winfo_children():
-            w.bind("<ButtonPress-1>", self._drag_start)
-            w.bind("<B1-Motion>",     self._drag_motion)
+        # Background glass layer
+        placeholder = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        self._bg_photo = ImageTk.PhotoImage(placeholder)
+        self._bg_item  = self._canvas.create_image(0, 0, anchor="nw", image=self._bg_photo)
 
-        # Controls row
-        ctrl = ctk.CTkFrame(self, fg_color=BASE, corner_radius=0)
-        ctrl.pack(fill="x", padx=12, pady=(8, 4))
+        # Inner card
+        card_w, card_h = W - 32, 90
+        card_placeholder = Image.new("RGBA", (card_w, card_h), (0, 0, 0, 0))
+        self._card_photo = ImageTk.PhotoImage(card_placeholder)
+        self._card_item  = self._canvas.create_image(16, 110, anchor="nw", image=self._card_photo)
 
-        ctk.CTkLabel(ctrl, text="Symbol",    font=(FONT, 9), text_color=FG
-                     ).grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(ctrl, text="Timeframe", font=(FONT, 9), text_color=FG
-                     ).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        # Accent glow orb (animated)
+        self._orb = self._canvas.create_oval(
+            W // 2 - 60, 95, W // 2 + 60, 175,
+            fill="", outline="", stipple=""
+        )
 
+        self._render_background()
+
+        # ── Close button (top-right) ─────────────────
+        btn_bg = "systemTransparent" if __import__("platform").system() == "Darwin" else "#010203"
+        close_btn = tk.Label(
+            self._canvas, text="✕",
+            bg=btn_bg, fg="#ffffff",
+            font=("Helvetica Neue", 11), cursor="hand2",
+        )
+        self._canvas.create_window(W - 18, 18, window=close_btn, anchor="center")
+        close_btn.bind("<Button-1>", lambda _: self.destroy())
+
+        # ── Pulse dot (top-left status) ───────────────
+        self._dot_id = self._canvas.create_oval(
+            18, 14, 26, 22, fill="#334466", outline=""
+        )
+
+        # ── Title label ───────────────────────────────
+        self._canvas.create_text(
+            W // 2, 20,
+            text="ATR  WIDGET",
+            fill="#aabbd4",
+            font=("Helvetica Neue", 9, "bold"),
+            anchor="center",
+            tags="title",
+        )
+
+        # ── ATR big number ────────────────────────────
+        self._atr_id = self._canvas.create_text(
+            W // 2, 148,
+            text="—",
+            fill=ACCENT_HEX,
+            font=("Helvetica Neue", 46, "bold"),
+            anchor="center",
+        )
+
+        # ── Unit label ────────────────────────────────
+        self._unit_id = self._canvas.create_text(
+            W // 2, 191,
+            text=f"pips  ·  ATR {ATR_PERIOD}",
+            fill="#8ab4d4",
+            font=("Helvetica Neue", 10),
+            anchor="center",
+        )
+
+        # ── Controls row (symbol + timeframe) ────────
+        ctrl_y = 48
+
+        # Symbol dropdown
         self.sym_var = ctk.StringVar(value="EUR/USD")
-        ctk.CTkOptionMenu(
-            ctrl, variable=self.sym_var,
+        sym_menu = ctk.CTkOptionMenu(
+            self._canvas,
+            variable=self.sym_var,
             values=list(self._sym_map.keys()),
-            fg_color=CARD, button_color=CARD,
-            button_hover_color="#1a4a80",
-            dropdown_fg_color=CARD,
-            text_color=FG, font=(FONT, 11), width=140,
+            fg_color="#1a3050",
+            button_color="#1a3050",
+            button_hover_color="#1e3a5f",
+            dropdown_fg_color="#12243e",
+            dropdown_hover_color="#1e3a5f",
+            text_color="#d0e8ff",
+            font=("Helvetica Neue", 11),
+            width=148, height=28,
+            corner_radius=10,
             command=lambda _: self._on_change(),
-        ).grid(row=1, column=0)
+        )
+        self._canvas.create_window(14, ctrl_y, anchor="nw", window=sym_menu)
 
+        # Timeframe dropdown
         self.tf_var = ctk.StringVar(value="Daily")
-        ctk.CTkOptionMenu(
-            ctrl, variable=self.tf_var,
+        tf_menu = ctk.CTkOptionMenu(
+            self._canvas,
+            variable=self.tf_var,
             values=list(TIMEFRAMES.keys()),
-            fg_color=CARD, button_color=CARD,
-            button_hover_color="#1a4a80",
-            dropdown_fg_color=CARD,
-            text_color=FG, font=(FONT, 11), width=100,
+            fg_color="#1a3050",
+            button_color="#1a3050",
+            button_hover_color="#1e3a5f",
+            dropdown_fg_color="#12243e",
+            dropdown_hover_color="#1e3a5f",
+            text_color="#d0e8ff",
+            font=("Helvetica Neue", 11),
+            width=110, height=28,
+            corner_radius=10,
             command=lambda _: self._on_change(),
-        ).grid(row=1, column=1, padx=(10, 0))
+        )
+        self._canvas.create_window(170, ctrl_y, anchor="nw", window=tf_menu)
 
-        ctk.CTkButton(
-            ctrl, text="⟳", width=36, height=28,
-            fg_color=ACCENT, hover_color="#00b894",
-            text_color=BASE, font=(FONT, 14, "bold"),
+        # Refresh button
+        ref_btn = ctk.CTkButton(
+            self._canvas,
+            text="⟳",
+            width=36, height=28,
+            fg_color="#1a3050",
+            hover_color="#1e4a30",
+            text_color=ACCENT_HEX,
+            font=("Helvetica Neue", 16),
+            corner_radius=10,
+            border_width=1,
+            border_color="#50dcb4",
             command=self._manual_refresh,
-        ).grid(row=1, column=2, padx=(8, 0))
-
-        # ATR card
-        card = ctk.CTkFrame(self, fg_color=CARD, corner_radius=10)
-        card.pack(fill="x", padx=12, pady=6)
-
-        self.atr_label = ctk.CTkLabel(
-            card, text="—",
-            font=(FONT, 40, "bold"), text_color=ACCENT,
         )
-        self.atr_label.pack(pady=(10, 0))
+        self._canvas.create_window(288, ctrl_y, anchor="nw", window=ref_btn)
 
-        self.unit_label = ctk.CTkLabel(
-            card, text=f"pips  (ATR {ATR_PERIOD})",
-            font=(FONT, 10), text_color=FG,
+        # ── Footer row ────────────────────────────────
+        self._price_id = self._canvas.create_text(
+            16, H - 14,
+            text="Price  —",
+            fill="#5a7a9a",
+            font=("Helvetica Neue", 9),
+            anchor="w",
         )
-        self.unit_label.pack(pady=(0, 10))
-
-        # Footer
-        footer = ctk.CTkFrame(self, fg_color=BASE, corner_radius=0)
-        footer.pack(fill="x", padx=12, pady=(0, 6))
-
-        self.price_label = ctk.CTkLabel(
-            footer, text="Price: —", font=(FONT, 9), text_color=FG,
+        self._time_id = self._canvas.create_text(
+            W - 16, H - 14,
+            text="",
+            fill="#3a5a7a",
+            font=("Helvetica Neue", 8),
+            anchor="e",
         )
-        self.price_label.pack(side="left")
 
-        self.time_label = ctk.CTkLabel(
-            footer, text="", font=(FONT, 8), text_color="#666666",
-        )
-        self.time_label.pack(side="right")
+        # ── Drag bindings (canvas + title area) ───────
+        self._canvas.bind("<ButtonPress-1>",  self._drag_start)
+        self._canvas.bind("<B1-Motion>",      self._drag_motion)
 
-    # ── Drag ────────────────────────────────────────
+    # ── Glow orb animation ───────────────────────────
+
+    def _animate(self):
+        """Pulse the accent glow orb subtly."""
+        self._pulse += 0.04 * self._pulse_dir
+        if self._pulse >= 1.0:
+            self._pulse_dir = -1
+        elif self._pulse <= 0.0:
+            self._pulse_dir = 1
+
+        alpha = int(18 + 14 * math.sin(self._pulse * math.pi))
+        r, g, b = ACCENT_RGB
+        # Simulate glow by changing orb colour (no true alpha in tk oval)
+        hex_col = f"#{r:02x}{g:02x}{b:02x}"
+        # Draw glow via canvas gradient approximation — layered ovals
+        self._canvas.delete("glow")
+        cx, cy = W // 2, 152
+        for i in range(5, 0, -1):
+            rad = 38 + i * 10
+            a_frac = (alpha / 255) * (i / 5) * 0.35
+            a_int = int(a_frac * 255)
+            gr = min(255, int(r * 0.6))
+            gg = min(255, int(g * 0.9))
+            gb = min(255, int(b * 0.85))
+            col = f"#{gr:02x}{gg:02x}{gb:02x}"
+            self._canvas.create_oval(
+                cx - rad, cy - rad // 2,
+                cx + rad, cy + rad // 2,
+                fill=col, outline="", tags="glow",
+            )
+        # Keep glow below text
+        self._canvas.tag_lower("glow", self._atr_id)
+        self._canvas.tag_lower("glow", self._card_item)
+
+        self.after(50, self._animate)
+
+    # ── Drag ─────────────────────────────────────────
 
     def _drag_start(self, e):
         self._drag_x = e.x_root - self.winfo_x()
@@ -288,7 +513,7 @@ class ATRWidget(ctk.CTk):
     def _drag_motion(self, e):
         self.geometry(f"+{e.x_root - self._drag_x}+{e.y_root - self._drag_y}")
 
-    # ── Refresh ─────────────────────────────────────
+    # ── Refresh logic ────────────────────────────────
 
     def _on_change(self):
         if self._job:
@@ -320,10 +545,10 @@ class ATRWidget(ctk.CTk):
     def _update_ui(self, result: dict):
         self._fetching = False
         if result.get("error"):
-            self.atr_label.configure(text="ERR",  text_color=ACCENT2)
-            self.unit_label.configure(text=result["error"][:45])
-            self.price_label.configure(text="Price: —")
-            self.dot.configure(text_color=ACCENT2)
+            self._canvas.itemconfig(self._atr_id,  text="ERR",  fill=ACCENT2_HEX)
+            self._canvas.itemconfig(self._unit_id, text=result["error"][:40])
+            self._canvas.itemconfig(self._price_id, text="Price  —")
+            self._canvas.itemconfig(self._dot_id, fill="#ff4455")
         else:
             v     = result["atr_pips"]
             price = result["current_price"]
@@ -334,18 +559,19 @@ class ATRWidget(ctk.CTk):
                          else f"{price:.4f}" if price >= 1
                          else f"{price:.6f}")
 
-            self.atr_label.configure(text=atr_str, text_color=ACCENT)
-            self.unit_label.configure(text=f"{unit}  (ATR {ATR_PERIOD})")
-            self.price_label.configure(text=f"Price: {price_str}")
-            self.dot.configure(text_color=ACCENT)
+            self._canvas.itemconfig(self._atr_id,  text=atr_str, fill=ACCENT_HEX)
+            self._canvas.itemconfig(self._unit_id, text=f"{unit}  ·  ATR {ATR_PERIOD}")
+            self._canvas.itemconfig(self._price_id, text=f"Price  {price_str}")
+            self._canvas.itemconfig(self._dot_id, fill=ACCENT_HEX)
 
-        self.time_label.configure(text=f"Updated {time.strftime('%H:%M:%S')}")
+        ts = time.strftime("%H:%M:%S")
+        self._canvas.itemconfig(self._time_id, text=ts)
         self._schedule()
 
     def _set_loading(self):
-        self.atr_label.configure(text="…", text_color="#888888")
-        self.unit_label.configure(text="Fetching data…")
-        self.dot.configure(text_color=AMBER)
+        self._canvas.itemconfig(self._atr_id,  text="···", fill="#4a6a8a")
+        self._canvas.itemconfig(self._unit_id, text="fetching…")
+        self._canvas.itemconfig(self._dot_id,  fill=AMBER_HEX)
 
 
 # ──────────────────────────────────────────────
